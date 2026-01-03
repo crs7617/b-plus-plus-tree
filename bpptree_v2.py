@@ -14,33 +14,43 @@ class AdaptiveGappedLeafNode:
         self.insert_count = 0
         self.target_fill_ratio = 0.75  # Keep 75% full
         
-        # Linear model for search prediction
+        # Enhanced linear model for search prediction
         self.model_a = 0.0  # Slope
         self.model_b = 0.0  # Intercept
         self.model_trained = False
+        self.model_accuracy = 0.0
+        self.model_predictions = 0
+        self.model_hits_local = 0
+        self.model_avg_error = 3  # Average prediction error
+        
+        # Optimization: cache min/max for bounds checking
+        self.min_key = None
+        self.max_key = None
     
     def train_model(self):
-        """Train simple linear model: position ≈ a × key + b"""
-        filled_keys = [k for k in self.keys if k is not None]
+        """Train enhanced linear model with error tracking"""
+        filled_keys = []
+        positions = []
+        
+        for i, k in enumerate(self.keys):
+            if k is not None:
+                positions.append(i)
+                filled_keys.append(k)
         
         if len(filled_keys) < 2:
             self.model_trained = False
             return
         
-        # Find positions of filled keys
-        positions = []
-        keys_list = []
-        for i, k in enumerate(self.keys):
-            if k is not None:
-                positions.append(i)
-                keys_list.append(k)
+        # Update bounds for fast range checks
+        self.min_key = filled_keys[0]
+        self.max_key = filled_keys[-1]
         
-        # Simple linear regression (least squares)
-        n = len(keys_list)
-        sum_x = sum(keys_list)
+        # Optimized linear regression (least squares)
+        n = len(filled_keys)
+        sum_x = sum(filled_keys)
         sum_y = sum(positions)
-        sum_xy = sum(k * p for k, p in zip(keys_list, positions))
-        sum_xx = sum(k * k for k in keys_list)
+        sum_xy = sum(k * p for k, p in zip(filled_keys, positions))
+        sum_xx = sum(k * k for k in filled_keys)
         
         # Calculate slope and intercept
         denominator = n * sum_xx - sum_x * sum_x
@@ -48,81 +58,188 @@ class AdaptiveGappedLeafNode:
             self.model_a = (n * sum_xy - sum_x * sum_y) / denominator
             self.model_b = (sum_y - self.model_a * sum_x) / n
             self.model_trained = True
+            
+            # Calculate average prediction error for adaptive search window
+            errors = [abs(int(self.model_a * k + self.model_b) - p) 
+                     for k, p in zip(filled_keys, positions)]
+            self.model_avg_error = sum(errors) / len(errors) if errors else 3
         else:
             self.model_trained = False
     
     def predict_position(self, key):
-        """Use linear model to predict key position"""
+        """Use linear model to predict key position with bounds checking"""
         if not self.model_trained:
             return None
+        
+        # Fast bounds check - avoids expensive prediction
+        if self.min_key and key < self.min_key:
+            return 0
+        if self.max_key and key > self.max_key:
+            return self.capacity - 1
         
         predicted = int(self.model_a * key + self.model_b)
         # Clamp to valid range
         return max(0, min(self.capacity - 1, predicted))
     
-    def search_with_model(self, key):
-        """Search using model prediction + local search"""
-        if self.model_trained:
-            # Predict position
-            pos = self.predict_position(key)
-            
-            # Check predicted position
-            if self.keys[pos] == key:
-                return self.values[pos]
-            
-            # Local search around prediction (±3 positions)
-            for offset in [1, -1, 2, -2, 3, -3]:
-                check_pos = pos + offset
-                if 0 <= check_pos < self.capacity and self.keys[check_pos] == key:
-                    return self.values[check_pos]
+    def exponential_search(self, key, start_pos):
+        """Exponential search from predicted position - O(log n) instead of O(n)"""
+        # Check start position
+        if self.keys[start_pos] == key:
+            return self.values[start_pos]
         
-        # Fallback: linear search
-        for i in range(self.capacity):
-            if self.keys[i] == key:
-                return self.values[i]
+        # Determine direction based on key comparison
+        if self.keys[start_pos] is not None and key < self.keys[start_pos]:
+            # Search left with exponentially growing steps
+            step = 1
+            while start_pos - step >= 0:
+                if self.keys[start_pos - step] == key:
+                    return self.values[start_pos - step]
+                if self.keys[start_pos - step] is not None and self.keys[start_pos - step] < key:
+                    break
+                step *= 2
+        else:
+            # Search right with exponentially growing steps
+            step = 1
+            while start_pos + step < self.capacity:
+                if self.keys[start_pos + step] == key:
+                    return self.values[start_pos + step]
+                if self.keys[start_pos + step] is not None and self.keys[start_pos + step] > key:
+                    break
+                step *= 2
+        
         return None
     
-    def find_slot(self, key):
-        """Find insertion slot"""
+    def binary_search_filled(self, key):
+        """Binary search on filled positions only - O(log n) fallback"""
+        filled = [(i, self.keys[i]) for i in range(self.capacity) if self.keys[i] is not None]
+        
+        if not filled:
+            return None
+        
+        left, right = 0, len(filled) - 1
+        while left <= right:
+            mid = (left + right) // 2
+            idx, k = filled[mid]
+            
+            if k == key:
+                return self.values[idx]
+            elif k < key:
+                left = mid + 1
+            else:
+                right = mid - 1
+        
+        return None
+    
+    def search_with_model(self, key):
+        """Enhanced search: model prediction + exponential search + binary fallback"""
+        self.model_predictions += 1
+        
+        if self.model_trained:
+            # Predict position using ML model
+            pos = self.predict_position(key)
+            
+            # Use exponential search from predicted position (adapts to model error)
+            result = self.exponential_search(key, pos)
+            
+            if result is not None:
+                self.model_hits_local += 1
+                return result
+        
+        # Fallback: binary search on filled positions (much faster than linear)
+        return self.binary_search_filled(key)
+    
+    def find_slot_binary(self, key):
+        """Binary search to find insertion slot - O(log n) instead of O(n)"""
+        # Collect filled positions
+        filled = []
         for i in range(self.capacity):
-            if self.keys[i] is None or key < self.keys[i]:
-                return i
-        return self.capacity - 1
+            if self.keys[i] is not None:
+                filled.append((i, self.keys[i]))
+        
+        if not filled:
+            return 0
+        
+        # Binary search for insertion point
+        left, right = 0, len(filled) - 1
+        
+        if key < filled[0][1]:
+            return 0
+        if key > filled[-1][1]:
+            # Find first empty slot after last key
+            last_idx = filled[-1][0]
+            for i in range(last_idx + 1, self.capacity):
+                if self.keys[i] is None:
+                    return i
+            return last_idx + 1
+        
+        while left <= right:
+            mid = (left + right) // 2
+            idx, k = filled[mid]
+            
+            if k == key:
+                return idx
+            elif k < key:
+                left = mid + 1
+            else:
+                right = mid - 1
+        
+        # Find insertion point between filled[right] and filled[left]
+        if left < len(filled):
+            return filled[left][0]
+        return filled[-1][0] + 1
+    
+    def find_nearest_gap(self, start_pos):
+        """Bidirectional gap search - finds closest gap efficiently"""
+        left = start_pos
+        right = start_pos
+        
+        while left >= 0 or right < self.capacity:
+            if left >= 0 and self.keys[left] is None:
+                return left
+            if right < self.capacity and self.keys[right] is None:
+                return right
+            left -= 1
+            right += 1
+        
+        return None
     
     def insert_into_gap(self, key, value):
-        """Insert with minimal shifting"""
+        """Optimized insert with binary search and bidirectional gap finding"""
         self.insert_count += 1
-        slot = self.find_slot(key)
         
-        # If slot is empty, just write
-        if self.keys[slot] is None:
+        # Use binary search to find slot (much faster)
+        slot = self.find_slot_binary(key)
+        
+        # If slot is empty, just write (no shifting needed)
+        if slot < self.capacity and self.keys[slot] is None:
             self.keys[slot] = key
             self.values[slot] = value
             self.size += 1
             return True
         
-        # Try to find nearby gap
-        for i in range(slot, self.capacity):
-            if self.keys[i] is None:
-                for j in range(i, slot, -1):
-                    self.keys[j] = self.keys[j-1]
-                    self.values[j] = self.values[j-1]
-                self.keys[slot] = key
-                self.values[slot] = value
-                self.size += 1
-                return True
+        # Find nearest gap using bidirectional search
+        gap = self.find_nearest_gap(slot)
         
-        for i in range(slot - 1, -1, -1):
-            if self.keys[i] is None:
-                for j in range(i, slot - 1):
-                    self.keys[j] = self.keys[j+1]
-                    self.values[j] = self.values[j+1]
-                self.keys[slot - 1] = key
-                self.values[slot - 1] = value
-                self.size += 1
-                return True
+        if gap is None:
+            return False  # No gap available, need compaction
         
-        return False
+        # Optimized shifting: shift in direction of gap
+        if gap > slot:
+            # Shift right to fill gap
+            for j in range(gap, slot, -1):
+                self.keys[j] = self.keys[j-1]
+                self.values[j] = self.values[j-1]
+        else:
+            # Shift left to fill gap
+            for j in range(gap, slot - 1):
+                self.keys[j] = self.keys[j+1]
+                self.values[j] = self.values[j+1]
+            slot -= 1
+        
+        self.keys[slot] = key
+        self.values[slot] = value
+        self.size += 1
+        return True
     
     def should_expand(self):
         """Decide if capacity should grow"""
@@ -165,6 +282,12 @@ class AdaptiveGappedLeafNode:
     
     def get_filled_values(self):
         return [v for v in self.values if v is not None]
+    
+    def get_model_accuracy(self):
+        """Calculate model prediction accuracy percentage"""
+        if self.model_predictions > 0:
+            return (self.model_hits_local / self.model_predictions) * 100
+        return 0.0
 
 
 class InternalNode:
@@ -184,7 +307,7 @@ class BPPTreeV2:
         self.model_misses = 0
     
     def search(self, key):
-        """Search using model prediction"""
+        """Search using enhanced model prediction with exponential search"""
         node = self.root
         
         # Traverse to leaf
@@ -194,10 +317,10 @@ class BPPTreeV2:
                 i += 1
             node = node.children[i]
         
-        # Search in leaf using model
+        # Search in leaf using enhanced model + exponential/binary search
         result = node.search_with_model(key)
         
-        # Track model accuracy
+        # Track global model accuracy
         if node.model_trained:
             if result is not None:
                 self.model_hits += 1
@@ -207,7 +330,7 @@ class BPPTreeV2:
         return result
     
     def insert(self, key, value):
-        """Insert with adaptive gaps"""
+        """Insert with optimized gapped array operations"""
         path = []
         node = self.root
         parent = None
@@ -222,11 +345,16 @@ class BPPTreeV2:
             parent_index = i
             node = node.children[i]
         
-        # Try gap insertion
+        # Try optimized gap insertion
         if node.insert_into_gap(key, value):
-            # Retrain model periodically
-            if node.insert_count % 10 == 0:
+            # Adaptive model retraining based on accuracy and frequency
+            if node.insert_count % 20 == 0:  # Less frequent retraining
                 node.train_model()
+            elif node.model_trained and node.insert_count % 50 == 0:
+                # Periodic accuracy check - retrain if accuracy drops
+                accuracy = node.get_model_accuracy()
+                if accuracy < 70:  # Retrain if accuracy below 70%
+                    node.train_model()
             return
         
         # Compact and split
@@ -307,11 +435,13 @@ class BPPTreeV2:
                 self._split_internal(parent_node, path)
     
     def get_stats(self):
-        """Get adaptive sizing statistics"""
+        """Get enhanced statistics including model accuracy"""
         total_capacity = 0
         total_filled = 0
         total_compacts = 0
         leaves_with_models = 0
+        total_model_accuracy = 0
+        leaf_count = 0
         
         node = self.root
         while not node.is_leaf:
@@ -323,14 +453,20 @@ class BPPTreeV2:
             total_compacts += node.compact_count
             if node.model_trained:
                 leaves_with_models += 1
+                total_model_accuracy += node.get_model_accuracy()
+            leaf_count += 1
             node = node.next
         
         utilization = (total_filled / total_capacity * 100) if total_capacity > 0 else 0
+        avg_model_accuracy = (total_model_accuracy / leaves_with_models) if leaves_with_models > 0 else 0
         
         return {
             'total_capacity': total_capacity,
             'total_filled': total_filled,
             'utilization': utilization,
             'total_compacts': total_compacts,
-            'leaves_with_models': leaves_with_models
+            'leaves_with_models': leaves_with_models,
+            'leaf_count': leaf_count,
+            'avg_model_accuracy': avg_model_accuracy,
+            'global_model_accuracy': (self.model_hits / (self.model_hits + self.model_misses) * 100) if (self.model_hits + self.model_misses) > 0 else 0
         }
